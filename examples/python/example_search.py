@@ -1,41 +1,42 @@
 import hnswlib
+import torch
 import numpy as np
-import pickle
+import time
 
-
-"""
-Example of search
-"""
+import sys
+f = open('a.log', 'w')
+sys.stdout = f
 
 dim = 128
-num_elements = 10000
+num_elements = 128000
 
-# Generating sample data
-data = np.float32(np.random.random((num_elements, dim)))
-ids = np.arange(num_elements)
+k = torch.randn(1, 1, num_elements, dim, device=torch.device("cuda:0"), dtype=torch.float, requires_grad=False)
 
-# Declaring index
-p = hnswlib.Index(space='l2', dim=dim)  # possible options are l2, cosine or ip
+hnsw_index = hnswlib.Index(space='ip', dim=dim)  # possible options are l2, cosine or ip
+hnsw_index.init_index(max_elements=1000000, ef_construction=200, M=90)
+hnsw_index.set_ef(100)
 
-# Initializing index - the maximum number of elements should be known beforehand
-p.init_index(max_elements=num_elements, ef_construction=200, M=16)
+k = k.chunk(128, dim=2)
 
-# Element insertion (can be called several times):
-p.add_items(data, ids)
+for idx in range(128):
+    current_k = k[idx].detach()
+    data = current_k[0][0].detach().to(torch.float).cpu().numpy()
+    b1 = time.time()
+    hnsw_index.add_items(data)
+    b2 = time.time()
+    print(f"add key latency: {b2-b1} ")
 
-# Controlling the recall by setting ef:
-p.set_ef(50)  # ef should always be > k
+q_full = torch.randn(1, 1, num_elements, dim, device=torch.device("cuda:0"), dtype=torch.float, requires_grad=False)
+data = q_full[0][0].detach().to(torch.float).cpu().numpy()
+b3 = time.time()
+hnsw_index.add_items(data)
+b4 = time.time()
+print(f"add key latency: {b4-b3} ")
 
-# Query dataset, k - number of the closest elements (returns 2 numpy arrays)
-labels, distances = p.knn_query(data, k=1)
+q_de = torch.randn(1, 1, 1, dim, device=torch.device("cuda:0"), dtype=torch.float, requires_grad=False)
+data = q_de[0][0].detach().to(torch.float).cpu().numpy()
+b5 = time.time()
+hnsw_index.add_items(data)
+b6 = time.time()
+print(f"add key latency: {b6-b5} ")
 
-# Index objects support pickling
-# WARNING: serialization via pickle.dumps(p) or p.__getstate__() is NOT thread-safe with p.add_items method!
-# Note: ef parameter is included in serialization; random number generator is initialized with random_seed on Index load
-p_copy = pickle.loads(pickle.dumps(p))  # creates a copy of index p using pickle round-trip
-
-### Index parameters are exposed as class properties:
-print(f"Parameters passed to constructor:  space={p_copy.space}, dim={p_copy.dim}")
-print(f"Index construction: M={p_copy.M}, ef_construction={p_copy.ef_construction}")
-print(f"Index size is {p_copy.element_count} and index capacity is {p_copy.max_elements}")
-print(f"Search speed/quality trade-off parameter: ef={p_copy.ef}")

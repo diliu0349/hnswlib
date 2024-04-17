@@ -1,4 +1,5 @@
 #include <iostream>
+#include <chrono>
 #include <pybind11/functional.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
@@ -92,6 +93,27 @@ class CustomFilterFunctor: public hnswlib::BaseFilterFunctor {
         return filter(id);
     }
 };
+
+bool filter1(hnswlib::labeltype id) {
+    return id % 1 == 0;
+}
+
+bool filter2(hnswlib::labeltype id, size_t true_k) {
+    return id < true_k;
+}
+
+// class CustomFilterFunctor2: public hnswlib::BaseFilterFunctor {
+//     std::function<bool(hnswlib::labeltype, size_t true_k)> filter;
+
+//  public:
+//     explicit CustomFilterFunctor2(const std::function<bool(hnswlib::labeltype)>& f) {
+//         filter = f;
+//     }
+
+//     bool operator()(hnswlib::labeltype id) {
+//         return filter(id);
+//     }
+// };
 
 
 inline void get_input_array_shapes(const py::buffer_info& buffer, size_t* rows, size_t* features) {
@@ -265,7 +287,11 @@ class Index {
             num_threads = 1;
         }
 
+        std::cout << num_threads << std::endl;
+
         std::vector<size_t> ids = get_input_ids_and_check_shapes(ids_, rows);
+
+        auto start = std::chrono::high_resolution_clock::now();
 
         {
             int start = 0;
@@ -301,6 +327,13 @@ class Index {
             }
             cur_l += rows;
         }
+
+        auto end = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+
+        // 打印时长
+        std::cout << "代码执行时长: " << duration.count() << " 毫秒" << std::endl;
+
     }
 
 
@@ -618,6 +651,7 @@ class Index {
         auto buffer = items.request();
         hnswlib::labeltype* data_numpy_l;
         dist_t* data_numpy_d;
+        int* data_numpy_m;
         size_t rows, features;
 
         if (num_threads <= 0)
@@ -634,6 +668,7 @@ class Index {
 
             data_numpy_l = new hnswlib::labeltype[rows * k];
             data_numpy_d = new dist_t[rows * k];
+            data_numpy_m = (int*)malloc(rows * sizeof(int));
 
             // Warning: search with a filter works slow in python in multithreaded mode. For best performance set num_threads=1
             CustomFilterFunctor idFilter(filter);
@@ -643,9 +678,12 @@ class Index {
                 ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
                     std::priority_queue<std::pair<dist_t, hnswlib::labeltype >> result = appr_alg->searchKnn(
                         (void*)items.data(row), k, p_idFilter);
-                    if (result.size() != k)
-                        throw std::runtime_error(
-                            "Cannot return the results in a contiguous 2D array. Probably ef or M is too small");
+
+                    // if (result.size() != k)
+                    //     throw std::runtime_error(
+                    //         "Cannot return the results in a contiguous 2D array. Probably ef or M is too small");
+
+                    data_numpy_m[row] = result.size();
                     for (int i = k - 1; i >= 0; i--) {
                         auto& result_tuple = result.top();
                         data_numpy_d[row * k + i] = result_tuple.first;
@@ -681,6 +719,9 @@ class Index {
         py::capsule free_when_done_d(data_numpy_d, [](void* f) {
             delete[] f;
             });
+        py::capsule free_when_done_m(data_numpy_m, [](void* f) {
+            delete[] f;
+            });
 
         return py::make_tuple(
             py::array_t<hnswlib::labeltype>(
@@ -693,7 +734,126 @@ class Index {
                 { rows, k },  // shape
                 { k * sizeof(dist_t), sizeof(dist_t) },  // C-style contiguous strides for each index
                 data_numpy_d,  // the data pointer
-                free_when_done_d));
+                free_when_done_d),
+            py::array_t<int>(
+                { rows },  // shape
+                { sizeof(int) },  // C-style contiguous strides for each index
+                data_numpy_m,  // the data pointer
+                free_when_done_m));
+    }
+
+    py::object knnQuery_return_numpy_filter(
+        py::object input,
+        size_t k = 1,
+        int num_threads = -1) {
+        py::array_t < dist_t, py::array::c_style | py::array::forcecast > items(input);
+        auto buffer = items.request();
+        hnswlib::labeltype* data_numpy_l;
+        dist_t* data_numpy_d;
+        int* data_numpy_m;
+        size_t rows, features;
+
+        if (num_threads <= 0)
+            num_threads = num_threads_default;
+
+        {
+            // print thread number
+            py::gil_scoped_release l;
+            get_input_array_shapes(buffer, &rows, &features);
+
+            // avoid using threads when the number of searches is small:
+            if (rows <= num_threads * 4) {
+                num_threads = 1;
+            }
+
+            data_numpy_l = new hnswlib::labeltype[rows * k];
+            data_numpy_d = new dist_t[rows * k];
+            data_numpy_m = (int*)malloc(rows * sizeof(int));
+
+            if (normalize == false) {
+                ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
+                    
+                    // Warning: search with a filter works slow in python in multithreaded mode. For best performance set num_threads=1
+                    size_t myThreshold = row + 1;
+                    // CustomFilterFunctor idFilter(filter1);
+                    CustomFilterFunctor idFilter(std::bind(filter2, std::placeholders::_1, myThreshold));
+                    CustomFilterFunctor* p_idFilter = filter2 ? &idFilter : nullptr;
+
+                    size_t true_k = k;
+                    if (k > row + 1) {
+                        true_k = row + 1;
+                    }
+
+                    std::priority_queue<std::pair<dist_t, hnswlib::labeltype >> result = appr_alg->searchKnn(
+                        (void*)items.data(row), true_k, p_idFilter);
+
+                    // 不能保证可以把所有结果都找回
+                    // if (result.size() != true_k)
+                    //     throw std::runtime_error(
+                    //         "Cannot return the results in a contiguous 2D array. Probably ef or M is too small");
+
+                    data_numpy_m[row] = result.size();
+                    for (int i = result.size() - 1; i >= 0; i--) {
+                        auto& result_tuple = result.top();
+                        data_numpy_d[row * k + i] = result_tuple.first;
+                        data_numpy_l[row * k + i] = result_tuple.second;
+                        result.pop();
+                    }
+                });
+            } else {
+                std::vector<float> norm_array(num_threads * features);
+                ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
+
+                    // Warning: search with a filter works slow in python in multithreaded mode. For best performance set num_threads=1
+                    CustomFilterFunctor idFilter(filter1);
+                    CustomFilterFunctor* p_idFilter = filter1 ? &idFilter : nullptr;
+
+                    float* data = (float*)items.data(row);
+
+                    size_t start_idx = threadId * dim;
+                    normalize_vector((float*)items.data(row), (norm_array.data() + start_idx));
+
+                    std::priority_queue<std::pair<dist_t, hnswlib::labeltype >> result = appr_alg->searchKnn(
+                        (void*)(norm_array.data() + start_idx), k, p_idFilter);
+                    if (result.size() != k)
+                        throw std::runtime_error(
+                            "Cannot return the results in a contiguous 2D array. Probably ef or M is too small");
+                    for (int i = k - 1; i >= 0; i--) {
+                        auto& result_tuple = result.top();
+                        data_numpy_d[row * k + i] = result_tuple.first;
+                        data_numpy_l[row * k + i] = result_tuple.second;
+                        result.pop();
+                    }
+                });
+            }
+        }
+        py::capsule free_when_done_l(data_numpy_l, [](void* f) {
+            delete[] f;
+            });
+        py::capsule free_when_done_d(data_numpy_d, [](void* f) {
+            delete[] f;
+            });
+        py::capsule free_when_done_m(data_numpy_m, [](void* f) {
+            delete[] f;
+            });
+
+        return py::make_tuple(
+            py::array_t<hnswlib::labeltype>(
+                { rows, k },  // shape
+                { k * sizeof(hnswlib::labeltype),
+                  sizeof(hnswlib::labeltype) },  // C-style contiguous strides for each index
+                data_numpy_l,  // the data pointer
+                free_when_done_l),
+            py::array_t<dist_t>(
+                { rows, k },  // shape
+                { k * sizeof(dist_t), sizeof(dist_t) },  // C-style contiguous strides for each index
+                data_numpy_d,  // the data pointer
+                free_when_done_d),
+            py::array_t<int>(
+                { rows },  // shape
+                { sizeof(int) },  // C-style contiguous strides for each index
+                data_numpy_m,  // the data pointer
+                free_when_done_m));
     }
 
 
@@ -928,6 +1088,11 @@ PYBIND11_PLUGIN(hnswlib) {
             py::arg("k") = 1,
             py::arg("num_threads") = -1,
             py::arg("filter") = py::none())
+        .def("knn_query_filter",
+            &Index<float>::knnQuery_return_numpy_filter,
+            py::arg("data"),
+            py::arg("k") = 1,
+            py::arg("num_threads") = -1)
         .def("add_items",
             &Index<float>::addItems,
             py::arg("data"),
