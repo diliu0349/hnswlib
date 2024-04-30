@@ -65,10 +65,10 @@ inline void ParallelFor(size_t start, size_t end, size_t numThreads, Function fn
 int main() {
     int dim = 128;               // Dimension of the elements
     int max_elements = 128000;   // Maximum number of elements, should be known beforehand
-    int M = 16;                 // Tightly connected with internal dimensionality of the data
+    int M = 90;                 // Tightly connected with internal dimensionality of the data
                                 // strongly affects the memory consumption
     int ef_construction = 200;  // Controls index search speed/build speed tradeoff
-    int num_threads = 24;       // Number of threads for operations with index
+    int num_threads = 20;       // Number of threads for operations with index
 
     // Initing index
     hnswlib::InnerProductSpace space(dim);
@@ -127,20 +127,20 @@ int main() {
     std::cout << "第二次执行时长: " << duration3.count() << " 毫秒" << std::endl;
 
 
-    // // Query the elements for themselves and measure recall
-    // std::vector<hnswlib::labeltype> neighbors(max_elements);
-    // ParallelFor(0, max_elements, num_threads, [&](size_t row, size_t threadId) {
-    //     std::priority_queue<std::pair<float, hnswlib::labeltype>> result = alg_hnsw->searchKnn(data + dim * row, 1);
-    //     hnswlib::labeltype label = result.top().second;
-    //     neighbors[row] = label;
-    // });
-    // float correct = 0;
-    // for (int i = 0; i < max_elements; i++) {
-    //     hnswlib::labeltype label = neighbors[i];
-    //     if (label == i) correct++;
-    // }
-    // float recall = correct / max_elements;
-    // std::cout << "Recall: " << recall << "\n";
+    // Query the elements for themselves and measure recall
+    std::vector<hnswlib::labeltype> neighbors(max_elements);
+    ParallelFor(0, max_elements, num_threads, [&](size_t row, size_t threadId) {
+        std::priority_queue<std::pair<float, hnswlib::labeltype>> result = alg_hnsw->searchKnn(data + dim * row, 1);
+        hnswlib::labeltype label = result.top().second;
+        neighbors[row] = label;
+    });
+    float correct = 0;
+    for (int i = 0; i < max_elements; i++) {
+        hnswlib::labeltype label = neighbors[i];
+        if (label == i) correct++;
+    }
+    float recall = correct / max_elements;
+    std::cout << "Recall: " << recall << "\n";
 
     delete[] data;
     delete alg_hnsw;
